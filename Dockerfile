@@ -1,19 +1,24 @@
-# Required in production. Generate using: python -c "import secrets; print(secrets.token_urlsafe(48))"
-SECRET_KEY=change-this-super-secret-key
+FROM python:3.11-slim
 
-# For direct local deploy, SQLite is used by default.
-# For PostgreSQL, set something like:
-# DATABASE_URL=postgresql://user:password@host:5432/dbname
-DATABASE_URL=sqlite:////app/data/app.db
+WORKDIR /app
 
-# Where uploaded files and SQLite DB are stored.
-DATA_DIR=/app/data
-MAX_UPLOAD_MB=50
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Optional real AI insights. If not set, the app uses local rule-based insights.
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Server
-PORT=10000
-FLASK_ENV=production
+COPY requirements.txt .
+
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p instance uploads
+
+EXPOSE 10000
+
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "wsgi:app"]
