@@ -1,0 +1,14 @@
+Flask==3.0.3
+Flask-Login==0.6.3
+Flask-SQLAlchemy==3.1.1
+Werkzeug==3.0.3
+python-dotenv==1.0.1
+dash==2.17.1
+dash-bootstrap-components==1.6.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.22.0
+openpyxl==3.1.5
+gunicorn==22.0.0
+psycopg2-binary==2.9.9
+openai==1.35.13

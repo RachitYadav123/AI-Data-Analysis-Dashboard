@@ -1,0 +1,45 @@
+from pathlib import Path
+
+from flask import Flask, redirect, request, url_for
+from flask_login import current_user
+
+from config import Config
+from .auth import bp as auth_bp
+from .dashboard import create_dashboard
+from .extensions import db, login_manager
+from .routes import bp as main_bp
+
+
+def create_app(config_class=Config):
+    app = Flask(__name__, instance_relative_config=True)
+    app.config.from_object(config_class)
+
+    Path(app.config["DATA_DIR"]).mkdir(parents=True, exist_ok=True)
+    Path(app.config["UPLOAD_DIR"]).mkdir(parents=True, exist_ok=True)
+    Path(app.config["REPORT_DIR"]).mkdir(parents=True, exist_ok=True)
+
+    db.init_app(app)
+    login_manager.init_app(app)
+
+    app.register_blueprint(main_bp)
+    app.register_blueprint(auth_bp)
+
+    @app.before_request
+    def protect_dashboard():
+        path = request.path or ""
+        if path.startswith("/dashboard") and not current_user.is_authenticated:
+            return redirect(url_for("auth.login", next=request.url))
+
+    @app.after_request
+    def security_headers(response):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
+
+    create_dashboard(app)
+
+    with app.app_context():
+        db.create_all()
+
+    return app

@@ -1,0 +1,570 @@
+import base64
+import json
+from io import BytesIO
+from typing import Any, Dict, List, Optional
+
+import dash
+import dash_bootstrap_components as dbc
+import pandas as pd
+from dash import ALL, Input, Output, State, callback_context, dash_table, dcc, html, no_update
+from flask import current_app
+from flask_login import current_user
+from werkzeug.datastructures import FileStorage
+
+from .data_engine import (
+    ai_explain_dataset,
+    apply_filters,
+    build_figures,
+    build_kpis,
+    choose_default_fields,
+    generate_insights,
+    infer_columns,
+    load_dataframe,
+    parse_custom_query,
+    profile_dataframe,
+)
+from .models import Dataset
+from .storage import save_uploaded_dataset
+
+
+def create_dashboard(server):
+    dash_app = dash.Dash(
+        __name__,
+        server=server,
+        url_base_pathname="/dashboard/",
+        external_stylesheets=[dbc.themes.BOOTSTRAP],
+        suppress_callback_exceptions=True,
+        title="AI Analytics Dashboard",
+    )
+    dash_app.layout = serve_layout
+    register_callbacks(dash_app)
+    return dash_app
+
+
+def serve_layout():
+    if not current_user or not current_user.is_authenticated:
+        return html.Div(
+            className="container py-5",
+            children=[
+                html.H2("Login required"),
+                html.A("Go to login", href="/login", className="btn btn-primary"),
+            ],
+        )
+
+    datasets = Dataset.query.filter_by(user_id=current_user.id).order_by(Dataset.created_at.desc()).all()
+    options = dataset_options(datasets)
+    default_dataset = options[0]["value"] if options else None
+
+    return dbc.Container(
+        fluid=True,
+        className="dash-shell",
+        children=[
+            dcc.Store(id="click-selection-store"),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            html.Div(
+                                className="brand-line",
+                                children=[html.Span("AI"), " Analytics Command Center"],
+                            ),
+                            html.P("Upload data, auto-profile it, filter interactively, and generate Power BI-style dashboards."),
+                        ],
+                        md=8,
+                    ),
+                    dbc.Col(
+                        html.Div(
+                            className="top-actions",
+                            children=[
+                                html.A("Home", href="/", className="btn btn-outline-light btn-sm"),
+                                html.A("Logout", href="/logout", className="btn btn-light btn-sm"),
+                            ],
+                        ),
+                        md=4,
+                    ),
+                ],
+                className="hero-panel",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(upload_card(), lg=3),
+                    dbc.Col(dataset_control_card(options, default_dataset), lg=3),
+                    dbc.Col(field_control_card(), lg=3),
+                    dbc.Col(selection_card(), lg=3),
+                ],
+                className="g-3 mt-2",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(filter_card(), lg=3),
+                    dbc.Col(
+                        [
+                            html.Div(id="kpi-row", className="kpi-grid"),
+                            dbc.Row(
+                                [
+                                    dbc.Col(dcc.Graph(id="bar-chart", config={"displayModeBar": False}), lg=7),
+                                    dbc.Col(dcc.Graph(id="donut-chart", config={"displayModeBar": False}), lg=5),
+                                ],
+                                className="g-3 mt-1 chart-row",
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(dcc.Graph(id="line-chart", config={"displayModeBar": False}), lg=7),
+                                    dbc.Col(dcc.Graph(id="hist-chart", config={"displayModeBar": False}), lg=5),
+                                ],
+                                className="g-3 mt-1 chart-row",
+                            ),
+                        ],
+                        lg=9,
+                    ),
+                ],
+                className="g-3 mt-2",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(insights_card(), lg=4),
+                    dbc.Col(profile_card(), lg=4),
+                    dbc.Col(custom_analysis_card(), lg=4),
+                ],
+                className="g-3 mt-2 mb-4",
+            ),
+        ],
+    )
+
+
+def upload_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("1. Upload datasheet"),
+            dcc.Upload(
+                id="upload-data",
+                children=html.Div(["Drag & drop or ", html.A("select CSV / Excel")]),
+                className="upload-box",
+                multiple=False,
+            ),
+            html.Div(id="upload-status", className="status-text mt-2"),
+        ],
+    )
+
+
+def dataset_control_card(options, default_dataset):
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("2. Dataset"),
+            dcc.Dropdown(id="dataset-select", options=options, value=default_dataset, placeholder="Choose uploaded dataset"),
+            html.Div(id="dataset-health", className="status-text mt-2"),
+        ],
+    )
+
+
+def field_control_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("3. Dashboard fields"),
+            html.Label("Metric"),
+            dcc.Dropdown(id="field-metric", placeholder="Numeric metric"),
+            html.Label("Category", className="mt-2"),
+            dcc.Dropdown(id="field-category", placeholder="Dimension"),
+            html.Label("Date", className="mt-2"),
+            dcc.Dropdown(id="field-date", placeholder="Date field"),
+        ],
+    )
+
+
+def selection_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("4. Visual selection"),
+            html.Div(id="selection-text", className="status-text", children="Click a bar or donut slice to cross-filter the whole dashboard."),
+            dbc.Button("Clear visual selection", id="clear-selection", size="sm", color="secondary", className="mt-3"),
+        ],
+    )
+
+
+def filter_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("Slicers & filters"),
+            html.Label("Slicer 1 column"),
+            dcc.Dropdown(id="filter-cat-column-1", placeholder="Category column"),
+            dcc.Dropdown(id="filter-cat-values-1", multi=True, placeholder="Values", className="mt-1"),
+            html.Label("Slicer 2 column", className="mt-3"),
+            dcc.Dropdown(id="filter-cat-column-2", placeholder="Category column"),
+            dcc.Dropdown(id="filter-cat-values-2", multi=True, placeholder="Values", className="mt-1"),
+            html.Label("Slicer 3 column", className="mt-3"),
+            dcc.Dropdown(id="filter-cat-column-3", placeholder="Category column"),
+            dcc.Dropdown(id="filter-cat-values-3", multi=True, placeholder="Values", className="mt-1"),
+            html.Hr(),
+            html.Label("Date range"),
+            dcc.DatePickerRange(id="date-range-filter", clearable=True),
+            html.Label("Numeric filter", className="mt-3"),
+            dcc.Dropdown(id="numeric-filter-column", placeholder="Numeric column"),
+            dcc.RangeSlider(id="numeric-range-filter", min=0, max=1, value=[0, 1], tooltip={"placement": "bottom", "always_visible": False}),
+        ],
+    )
+
+
+def insights_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("Dynamic key insights"),
+            html.Div(id="insights-list"),
+            html.Hr(),
+            html.H6("AI summary"),
+            html.Pre(id="ai-summary", className="ai-summary"),
+        ],
+    )
+
+
+def profile_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("Auto data profile"),
+            html.Div(id="profile-summary"),
+        ],
+    )
+
+
+def custom_analysis_card():
+    return dbc.Card(
+        className="panel-card h-100",
+        body=True,
+        children=[
+            html.H5("Ask custom analysis"),
+            dcc.Textarea(
+                id="custom-question",
+                placeholder="Examples: sales by region, top 10 products by profit, monthly revenue trend, missing values, correlation",
+                className="custom-input",
+            ),
+            dbc.Button("Generate", id="custom-run", color="primary", size="sm", className="mt-2"),
+            html.Div(id="custom-summary", className="status-text mt-2"),
+            dcc.Graph(id="custom-chart", config={"displayModeBar": False}),
+            dash_table.DataTable(
+                id="custom-table",
+                page_size=6,
+                style_table={"overflowX": "auto"},
+                style_cell={"fontFamily": "Inter, Arial", "fontSize": 12, "padding": "6px", "textAlign": "left"},
+            ),
+        ],
+    )
+
+
+def dataset_options(datasets: List[Dataset]) -> List[Dict[str, Any]]:
+    return [
+        {"label": f"{d.original_filename} · {d.row_count:,} rows · {d.column_count} cols", "value": d.id}
+        for d in datasets
+    ]
+
+
+def get_user_dataset(dataset_id: Optional[int]) -> Optional[Dataset]:
+    if not dataset_id or not current_user.is_authenticated:
+        return None
+    return Dataset.query.filter_by(id=int(dataset_id), user_id=current_user.id).first()
+
+
+def get_df(dataset_id: Optional[int]) -> Optional[pd.DataFrame]:
+    dataset = get_user_dataset(dataset_id)
+    if not dataset:
+        return None
+    return load_dataframe(dataset.file_path)
+
+
+def options_from_columns(columns: List[str]) -> List[Dict[str, str]]:
+    return [{"label": c, "value": c} for c in columns]
+
+
+def category_value_options(df: pd.DataFrame, column: Optional[str]) -> List[Dict[str, str]]:
+    if not column or column not in df.columns:
+        return []
+    values = df[column].dropna().astype(str).value_counts().head(250).index.tolist()
+    return [{"label": v, "value": v} for v in values]
+
+
+def profile_component(profile: Dict[str, Any]):
+    return html.Div(
+        [
+            html.Div([html.B("Rows: "), f"{profile['rows']:,}"]),
+            html.Div([html.B("Columns: "), f"{profile['columns']:,}"]),
+            html.Div([html.B("Numeric: "), str(len(profile["numeric_columns"]))]),
+            html.Div([html.B("Categorical: "), str(len(profile["categorical_columns"]))]),
+            html.Div([html.B("Date: "), str(len(profile["date_columns"]))]),
+            html.Div([html.B("Missing cells: "), f"{profile['missing_total']:,}"]),
+            html.Div([html.B("Duplicate rows: "), f"{profile['duplicate_rows']:,}"]),
+            html.Hr(),
+            html.Small("Detected columns"),
+            html.Div("Numeric: " + ", ".join(profile["numeric_columns"][:10]) if profile["numeric_columns"] else "Numeric: none"),
+            html.Div("Categorical: " + ", ".join(profile["categorical_columns"][:10]) if profile["categorical_columns"] else "Categorical: none"),
+            html.Div("Date: " + ", ".join(profile["date_columns"][:5]) if profile["date_columns"] else "Date: none"),
+        ],
+        className="profile-box",
+    )
+
+
+def register_callbacks(app):
+    @app.callback(
+        Output("upload-status", "children"),
+        Output("dataset-select", "options"),
+        Output("dataset-select", "value"),
+        Input("upload-data", "contents"),
+        State("upload-data", "filename"),
+        prevent_initial_call=True,
+    )
+    def handle_upload(contents, filename):
+        if not contents:
+            return no_update, no_update, no_update
+        try:
+            header, encoded = contents.split(",", 1)
+            raw = base64.b64decode(encoded)
+            max_bytes = current_app.config["MAX_CONTENT_LENGTH"]
+            if len(raw) > max_bytes:
+                return f"File too large. Max {current_app.config['MAX_UPLOAD_MB']} MB.", no_update, no_update
+            fs = FileStorage(stream=BytesIO(raw), filename=filename)
+            dataset = save_uploaded_dataset(fs, current_user.id)
+            datasets = Dataset.query.filter_by(user_id=current_user.id).order_by(Dataset.created_at.desc()).all()
+            return f"Uploaded {dataset.original_filename} successfully.", dataset_options(datasets), dataset.id
+        except Exception as exc:
+            return f"Upload failed: {exc}", no_update, no_update
+
+    @app.callback(
+        Output("field-metric", "options"),
+        Output("field-category", "options"),
+        Output("field-date", "options"),
+        Output("field-metric", "value"),
+        Output("field-category", "value"),
+        Output("field-date", "value"),
+        Output("filter-cat-column-1", "options"),
+        Output("filter-cat-column-2", "options"),
+        Output("filter-cat-column-3", "options"),
+        Output("filter-cat-column-1", "value"),
+        Output("filter-cat-column-2", "value"),
+        Output("filter-cat-column-3", "value"),
+        Output("numeric-filter-column", "options"),
+        Output("numeric-filter-column", "value"),
+        Output("date-range-filter", "start_date"),
+        Output("date-range-filter", "end_date"),
+        Output("date-range-filter", "min_date_allowed"),
+        Output("date-range-filter", "max_date_allowed"),
+        Output("numeric-range-filter", "min"),
+        Output("numeric-range-filter", "max"),
+        Output("numeric-range-filter", "value"),
+        Output("numeric-range-filter", "marks"),
+        Output("dataset-health", "children"),
+        Output("profile-summary", "children"),
+        Input("dataset-select", "value"),
+    )
+    def configure_dataset(dataset_id):
+        df = get_df(dataset_id)
+        if df is None:
+            empty = []
+            return empty, empty, empty, None, None, None, empty, empty, empty, None, None, None, empty, None, None, None, None, None, 0, 1, [0, 1], {}, "No dataset selected.", "Upload a CSV or Excel file to start."
+
+        cols = infer_columns(df)
+        defaults = choose_default_fields(df)
+        metric_options = options_from_columns(cols["numeric"])
+        cat_options = options_from_columns(cols["categorical"])
+        date_options = options_from_columns(cols["date"])
+
+        cat_defaults = cols["categorical"][:3]
+        cat_defaults += [None] * (3 - len(cat_defaults))
+
+        date_min = date_max = None
+        if defaults["date"] and defaults["date"] in df.columns:
+            series = df[defaults["date"]].dropna()
+            if not series.empty:
+                date_min = series.min().date().isoformat()
+                date_max = series.max().date().isoformat()
+
+        nmin, nmax, nvalue, marks = 0, 1, [0, 1], {}
+        if defaults["metric"] and defaults["metric"] in df.columns:
+            s = df[defaults["metric"]].dropna()
+            if not s.empty:
+                nmin = float(s.min())
+                nmax = float(s.max())
+                if nmin == nmax:
+                    nmax = nmin + 1
+                nvalue = [nmin, nmax]
+                marks = {nmin: f"{nmin:.0f}", nmax: f"{nmax:.0f}"}
+
+        profile = profile_dataframe(df)
+        health = f"{len(df):,} rows loaded. Click visuals or use slicers to filter."
+        return (
+            metric_options,
+            cat_options,
+            date_options,
+            defaults["metric"],
+            defaults["category"],
+            defaults["date"],
+            cat_options,
+            cat_options,
+            cat_options,
+            cat_defaults[0],
+            cat_defaults[1],
+            cat_defaults[2],
+            metric_options,
+            defaults["metric"],
+            date_min,
+            date_max,
+            date_min,
+            date_max,
+            nmin,
+            nmax,
+            nvalue,
+            marks,
+            health,
+            profile_component(profile),
+        )
+
+    for idx in [1, 2, 3]:
+        app.callback(
+            Output(f"filter-cat-values-{idx}", "options"),
+            Output(f"filter-cat-values-{idx}", "value"),
+            Input(f"filter-cat-column-{idx}", "value"),
+            Input("dataset-select", "value"),
+        )(make_category_values_callback())
+
+    @app.callback(
+        Output("numeric-range-filter", "min", allow_duplicate=True),
+        Output("numeric-range-filter", "max", allow_duplicate=True),
+        Output("numeric-range-filter", "value", allow_duplicate=True),
+        Output("numeric-range-filter", "marks", allow_duplicate=True),
+        Input("numeric-filter-column", "value"),
+        State("dataset-select", "value"),
+        prevent_initial_call=True,
+    )
+    def update_numeric_range(column, dataset_id):
+        df = get_df(dataset_id)
+        if df is None or not column or column not in df.columns:
+            return 0, 1, [0, 1], {}
+        s = df[column].dropna()
+        if s.empty:
+            return 0, 1, [0, 1], {}
+        nmin, nmax = float(s.min()), float(s.max())
+        if nmin == nmax:
+            nmax = nmin + 1
+        return nmin, nmax, [nmin, nmax], {nmin: f"{nmin:.0f}", nmax: f"{nmax:.0f}"}
+
+    @app.callback(
+        Output("click-selection-store", "data"),
+        Output("selection-text", "children"),
+        Input("bar-chart", "clickData"),
+        Input("donut-chart", "clickData"),
+        Input("clear-selection", "n_clicks"),
+        State("field-category", "value"),
+        prevent_initial_call=True,
+    )
+    def update_click_selection(bar_click, donut_click, clear_clicks, category):
+        trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
+        if trigger == "clear-selection":
+            return None, "Visual selection cleared."
+        click = bar_click if trigger == "bar-chart" else donut_click
+        if click and category:
+            point = click["points"][0]
+            value = point.get("x") or point.get("label")
+            return {"column": category, "value": str(value)}, f"Cross-filter active: {category} = {value}"
+        return no_update, no_update
+
+    @app.callback(
+        Output("kpi-row", "children"),
+        Output("bar-chart", "figure"),
+        Output("donut-chart", "figure"),
+        Output("line-chart", "figure"),
+        Output("hist-chart", "figure"),
+        Output("insights-list", "children"),
+        Output("ai-summary", "children"),
+        Input("dataset-select", "value"),
+        Input("field-metric", "value"),
+        Input("field-category", "value"),
+        Input("field-date", "value"),
+        Input("filter-cat-column-1", "value"),
+        Input("filter-cat-values-1", "value"),
+        Input("filter-cat-column-2", "value"),
+        Input("filter-cat-values-2", "value"),
+        Input("filter-cat-column-3", "value"),
+        Input("filter-cat-values-3", "value"),
+        Input("date-range-filter", "start_date"),
+        Input("date-range-filter", "end_date"),
+        Input("numeric-filter-column", "value"),
+        Input("numeric-range-filter", "value"),
+        Input("click-selection-store", "data"),
+    )
+    def update_dashboard(
+        dataset_id,
+        metric,
+        category,
+        date_col,
+        cat_col1,
+        cat_val1,
+        cat_col2,
+        cat_val2,
+        cat_col3,
+        cat_val3,
+        start_date,
+        end_date,
+        numeric_col,
+        numeric_range,
+        click_selection,
+    ):
+        df = get_df(dataset_id)
+        if df is None:
+            fig = dash.no_update
+            return "", fig, fig, fig, fig, "", ""
+
+        filters = {
+            "categorical": {},
+            "date": {"column": date_col, "start": start_date, "end": end_date} if date_col else None,
+            "numeric": {"column": numeric_col, "range": numeric_range} if numeric_col and numeric_range else None,
+        }
+        for col, values in [(cat_col1, cat_val1), (cat_col2, cat_val2), (cat_col3, cat_val3)]:
+            if col and values:
+                filters["categorical"][col] = values
+
+        filtered = apply_filters(df, filters, click_selection)
+        kpi_cards = [html.Div(className="kpi-card", children=[html.Small(k["label"]), html.Strong(k["value"])]) for k in build_kpis(filtered, metric)]
+        figures = build_figures(filtered, metric, category, date_col)
+        insights = generate_insights(filtered, metric, category, date_col)
+        profile = profile_dataframe(filtered)
+        ai_summary = ai_explain_dataset(profile, insights)
+        insights_markup = html.Ul([html.Li(x) for x in insights], className="insight-list")
+        return kpi_cards, figures["bar"], figures["donut"], figures["line"], figures["hist"], insights_markup, ai_summary
+
+    @app.callback(
+        Output("custom-chart", "figure"),
+        Output("custom-table", "columns"),
+        Output("custom-table", "data"),
+        Output("custom-summary", "children"),
+        Input("custom-run", "n_clicks"),
+        State("custom-question", "value"),
+        State("dataset-select", "value"),
+        prevent_initial_call=True,
+    )
+    def run_custom_analysis(n_clicks, question, dataset_id):
+        df = get_df(dataset_id)
+        if df is None:
+            return {}, [], [], "Select or upload a dataset first."
+        result = parse_custom_query(question or "", df)
+        table = result.get("table", [])
+        columns = [{"name": str(c), "id": str(c)} for c in (table[0].keys() if table else [])]
+        return result["figure"], columns, table, result["summary"]
+
+
+def make_category_values_callback():
+    def _callback(column, dataset_id):
+        df = get_df(dataset_id)
+        if df is None or not column:
+            return [], []
+        return category_value_options(df, column), []
+    return _callback

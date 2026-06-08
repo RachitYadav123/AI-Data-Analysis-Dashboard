@@ -1,0 +1,415 @@
+import json
+import math
+import os
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+from .storage import safe_read_dataframe
+
+
+@lru_cache(maxsize=64)
+def load_dataframe_cached(path: str, mtime: float) -> pd.DataFrame:
+    df = safe_read_dataframe(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    return normalize_dataframe(df)
+
+
+def load_dataframe(path: str) -> pd.DataFrame:
+    return load_dataframe_cached(path, Path(path).stat().st_mtime).copy()
+
+
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = df.copy()
+    cleaned = cleaned.dropna(axis=1, how="all")
+    cleaned = cleaned.dropna(axis=0, how="all")
+    cleaned.columns = [str(c).strip() for c in cleaned.columns]
+
+    for col in cleaned.columns:
+        if cleaned[col].dtype == "object":
+            cleaned[col] = cleaned[col].astype(str).replace({"nan": np.nan, "None": np.nan})
+            # Try date parsing only when many values look date-like.
+            sample = cleaned[col].dropna().astype(str).head(50)
+            date_like = sample.str.contains(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}|\d{1,2}\s+[A-Za-z]{3,}", regex=True).mean() if len(sample) else 0
+            if date_like >= 0.45:
+                parsed = pd.to_datetime(cleaned[col], errors="coerce", dayfirst=False)
+                if parsed.notna().mean() >= 0.55:
+                    cleaned[col] = parsed
+                    continue
+            # Try numeric conversion for strings like "₹1,200" or "$1,200".
+            stripped = cleaned[col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True)
+            converted = pd.to_numeric(stripped, errors="coerce")
+            if converted.notna().mean() >= 0.75 and converted.nunique(dropna=True) > 2:
+                cleaned[col] = converted
+    return cleaned
+
+
+def infer_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
+    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    dates = df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns.tolist()
+    categorical = []
+    text = []
+    for col in df.columns:
+        if col in numeric or col in dates:
+            continue
+        nunique = df[col].nunique(dropna=True)
+        ratio = nunique / max(len(df), 1)
+        if nunique <= 80 or ratio <= 0.25:
+            categorical.append(col)
+        else:
+            text.append(col)
+    return {"numeric": numeric, "date": dates, "categorical": categorical, "text": text}
+
+
+def choose_default_fields(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    cols = infer_columns(df)
+    metric = pick_metric(cols["numeric"])
+    category = pick_category(df, cols["categorical"])
+    date_col = cols["date"][0] if cols["date"] else None
+    return {"metric": metric, "category": category, "date": date_col}
+
+
+def pick_metric(numeric_cols: List[str]) -> Optional[str]:
+    if not numeric_cols:
+        return None
+    priority = ["sales", "revenue", "amount", "profit", "income", "price", "total", "quantity", "qty", "orders"]
+    lower = {c.lower(): c for c in numeric_cols}
+    for term in priority:
+        for low, original in lower.items():
+            if term in low:
+                return original
+    return numeric_cols[0]
+
+
+def pick_category(df: pd.DataFrame, categorical_cols: List[str]) -> Optional[str]:
+    if not categorical_cols:
+        return None
+    priority = ["region", "state", "city", "country", "category", "segment", "product", "brand", "customer"]
+    lower = {c.lower(): c for c in categorical_cols}
+    for term in priority:
+        for low, original in lower.items():
+            if term in low:
+                return original
+    ranked = sorted(categorical_cols, key=lambda c: df[c].nunique(dropna=True))
+    return ranked[0]
+
+
+def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
+    cols = infer_columns(df)
+    missing_total = int(df.isna().sum().sum())
+    duplicate_rows = int(df.duplicated().sum())
+    memory_mb = round(float(df.memory_usage(deep=True).sum()) / (1024 * 1024), 2)
+
+    numeric_summary = []
+    for col in cols["numeric"][:20]:
+        s = df[col].dropna()
+        numeric_summary.append({
+            "column": col,
+            "sum": safe_number(s.sum()),
+            "mean": safe_number(s.mean()),
+            "median": safe_number(s.median()),
+            "min": safe_number(s.min()),
+            "max": safe_number(s.max()),
+            "missing": int(df[col].isna().sum()),
+        })
+
+    category_summary = []
+    for col in cols["categorical"][:20]:
+        vc = df[col].astype(str).replace("nan", np.nan).value_counts(dropna=True).head(5)
+        category_summary.append({
+            "column": col,
+            "unique": int(df[col].nunique(dropna=True)),
+            "top_values": [{"value": str(k), "count": int(v)} for k, v in vc.items()],
+            "missing": int(df[col].isna().sum()),
+        })
+
+    return {
+        "rows": int(df.shape[0]),
+        "columns": int(df.shape[1]),
+        "missing_total": missing_total,
+        "duplicate_rows": duplicate_rows,
+        "memory_mb": memory_mb,
+        "numeric_columns": cols["numeric"],
+        "categorical_columns": cols["categorical"],
+        "date_columns": cols["date"],
+        "text_columns": cols["text"],
+        "numeric_summary": numeric_summary,
+        "category_summary": category_summary,
+    }
+
+
+def safe_number(value: Any) -> Optional[float]:
+    try:
+        if pd.isna(value) or not np.isfinite(value):
+            return None
+        return round(float(value), 4)
+    except Exception:
+        return None
+
+
+def apply_filters(
+    df: pd.DataFrame,
+    filters: Dict[str, Any],
+    click_selection: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    categorical_filters = filters.get("categorical", {}) if filters else {}
+    for col, values in categorical_filters.items():
+        if col in out.columns and values:
+            out = out[out[col].astype(str).isin([str(v) for v in values])]
+
+    date_filter = filters.get("date") if filters else None
+    if date_filter and date_filter.get("column") in out.columns:
+        col = date_filter["column"]
+        start = pd.to_datetime(date_filter.get("start"), errors="coerce")
+        end = pd.to_datetime(date_filter.get("end"), errors="coerce")
+        if pd.notna(start):
+            out = out[out[col] >= start]
+        if pd.notna(end):
+            out = out[out[col] <= end]
+
+    numeric_filter = filters.get("numeric") if filters else None
+    if numeric_filter and numeric_filter.get("column") in out.columns:
+        col = numeric_filter["column"]
+        low, high = numeric_filter.get("range", [None, None])
+        if low is not None:
+            out = out[out[col] >= low]
+        if high is not None:
+            out = out[out[col] <= high]
+
+    if click_selection and click_selection.get("column") in out.columns:
+        col = click_selection["column"]
+        val = str(click_selection.get("value"))
+        out = out[out[col].astype(str) == val]
+
+    return out
+
+
+def build_kpis(df: pd.DataFrame, metric: Optional[str]) -> List[Dict[str, str]]:
+    kpis = [
+        {"label": "Rows", "value": f"{len(df):,}"},
+        {"label": "Columns", "value": f"{df.shape[1]:,}"},
+        {"label": "Missing cells", "value": f"{int(df.isna().sum().sum()):,}"},
+        {"label": "Duplicate rows", "value": f"{int(df.duplicated().sum()):,}"},
+    ]
+    if metric and metric in df.columns and pd.api.types.is_numeric_dtype(df[metric]):
+        s = df[metric].dropna()
+        if not s.empty:
+            kpis.insert(0, {"label": f"Total {metric}", "value": human_number(float(s.sum()))})
+            kpis.insert(1, {"label": f"Avg {metric}", "value": human_number(float(s.mean()))})
+    return kpis[:6]
+
+
+def human_number(value: float) -> str:
+    abs_val = abs(value)
+    if abs_val >= 1_000_000_000:
+        return f"{value/1_000_000_000:.2f}B"
+    if abs_val >= 1_000_000:
+        return f"{value/1_000_000:.2f}M"
+    if abs_val >= 1_000:
+        return f"{value/1_000:.2f}K"
+    return f"{value:,.2f}"
+
+
+def empty_figure(title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        annotations=[{"text": "Not enough compatible data", "xref": "paper", "yref": "paper", "showarrow": False, "x": 0.5, "y": 0.5}],
+    )
+    return fig
+
+
+def build_figures(df: pd.DataFrame, metric: Optional[str], category: Optional[str], date_col: Optional[str]) -> Dict[str, go.Figure]:
+    figures: Dict[str, go.Figure] = {}
+
+    if category and metric and category in df.columns and metric in df.columns and pd.api.types.is_numeric_dtype(df[metric]):
+        grouped = df.groupby(category, dropna=False)[metric].sum().sort_values(ascending=False).head(15).reset_index()
+        grouped[category] = grouped[category].astype(str)
+        figures["bar"] = px.bar(grouped, x=category, y=metric, title=f"{metric} by {category}")
+        figures["bar"].update_layout(template="plotly_white", clickmode="event+select")
+        figures["donut"] = px.pie(grouped.head(8), names=category, values=metric, hole=0.45, title=f"Share of {metric}")
+        figures["donut"].update_layout(template="plotly_white", clickmode="event+select")
+    elif category and category in df.columns:
+        counts = df[category].astype(str).value_counts().head(15).reset_index()
+        counts.columns = [category, "count"]
+        figures["bar"] = px.bar(counts, x=category, y="count", title=f"Record count by {category}")
+        figures["bar"].update_layout(template="plotly_white", clickmode="event+select")
+        figures["donut"] = px.pie(counts.head(8), names=category, values="count", hole=0.45, title=f"Record share by {category}")
+        figures["donut"].update_layout(template="plotly_white", clickmode="event+select")
+    else:
+        figures["bar"] = empty_figure("Category breakdown")
+        figures["donut"] = empty_figure("Category share")
+
+    if date_col and metric and date_col in df.columns and metric in df.columns and pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        trend = df.dropna(subset=[date_col]).copy()
+        if not trend.empty:
+            trend["__period"] = trend[date_col].dt.to_period("M").dt.to_timestamp()
+            trend = trend.groupby("__period")[metric].sum().reset_index()
+            figures["line"] = px.line(trend, x="__period", y=metric, markers=True, title=f"Monthly {metric} trend")
+            figures["line"].update_layout(template="plotly_white", xaxis_title=date_col)
+        else:
+            figures["line"] = empty_figure("Trend")
+    else:
+        figures["line"] = empty_figure("Trend")
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if metric and metric in numeric_cols:
+        figures["hist"] = px.histogram(df, x=metric, nbins=35, title=f"Distribution of {metric}")
+        figures["hist"].update_layout(template="plotly_white")
+    elif numeric_cols:
+        col = numeric_cols[0]
+        figures["hist"] = px.histogram(df, x=col, nbins=35, title=f"Distribution of {col}")
+        figures["hist"].update_layout(template="plotly_white")
+    else:
+        figures["hist"] = empty_figure("Distribution")
+
+    return figures
+
+
+def generate_insights(df: pd.DataFrame, metric: Optional[str], category: Optional[str], date_col: Optional[str]) -> List[str]:
+    insights: List[str] = []
+    if df.empty:
+        return ["No rows match the current filters."]
+
+    missing_rate = df.isna().mean().sort_values(ascending=False)
+    if not missing_rate.empty and missing_rate.iloc[0] > 0:
+        insights.append(f"Highest missing-value column is '{missing_rate.index[0]}' at {missing_rate.iloc[0] * 100:.1f}%.")
+
+    dup = df.duplicated().sum()
+    if dup:
+        insights.append(f"Dataset contains {int(dup):,} duplicate rows in the current view.")
+
+    if metric and metric in df.columns and pd.api.types.is_numeric_dtype(df[metric]):
+        s = df[metric].dropna()
+        if not s.empty:
+            insights.append(f"Total {metric} is {human_number(float(s.sum()))}; average is {human_number(float(s.mean()))}.")
+            if len(s) >= 8:
+                q1, q3 = s.quantile([0.25, 0.75])
+                iqr = q3 - q1
+                if iqr > 0:
+                    outliers = s[(s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)]
+                    if len(outliers):
+                        insights.append(f"Detected {len(outliers):,} potential outliers in {metric} using IQR logic.")
+
+    if category and metric and category in df.columns and metric in df.columns and pd.api.types.is_numeric_dtype(df[metric]):
+        grouped = df.groupby(category, dropna=False)[metric].sum().sort_values(ascending=False)
+        if len(grouped):
+            top_name = str(grouped.index[0])
+            top_val = float(grouped.iloc[0])
+            share = top_val / grouped.sum() * 100 if grouped.sum() else 0
+            insights.append(f"Top {category} is '{top_name}' with {human_number(top_val)} {metric}, contributing {share:.1f}% of visible total.")
+
+    if date_col and metric and date_col in df.columns and metric in df.columns and pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        trend = df.dropna(subset=[date_col]).copy()
+        if not trend.empty:
+            trend["__period"] = trend[date_col].dt.to_period("M").dt.to_timestamp()
+            monthly = trend.groupby("__period")[metric].sum().sort_index()
+            if len(monthly) >= 2:
+                diff = monthly.iloc[-1] - monthly.iloc[0]
+                direction = "up" if diff >= 0 else "down"
+                insights.append(f"From first to latest month, {metric} moved {direction} by {human_number(abs(float(diff)))}.")
+
+    return insights[:7] or ["No strong automatic insight found for the current data view."]
+
+
+def parse_custom_query(query: str, df: pd.DataFrame) -> Dict[str, Any]:
+    q = (query or "").strip().lower()
+    cols = infer_columns(df)
+    defaults = choose_default_fields(df)
+
+    metric = find_column_in_text(q, cols["numeric"]) or defaults["metric"]
+    category = find_column_in_text(q, cols["categorical"]) or defaults["category"]
+    date_col = find_column_in_text(q, cols["date"]) or defaults["date"]
+
+    top_match = re.search(r"top\s+(\d+)", q)
+    limit = int(top_match.group(1)) if top_match else 10
+    limit = max(3, min(limit, 50))
+
+    if "missing" in q or "null" in q:
+        table = df.isna().sum().sort_values(ascending=False).reset_index()
+        table.columns = ["column", "missing_count"]
+        table["missing_percent"] = (table["missing_count"] / max(len(df), 1) * 100).round(2)
+        fig = px.bar(table.head(limit), x="column", y="missing_count", title="Missing values by column")
+        fig.update_layout(template="plotly_white")
+        return {"type": "missing", "figure": fig, "table": table.head(limit).to_dict("records"), "summary": "Missing-value analysis generated."}
+
+    if "correlation" in q or "corr" in q:
+        nums = cols["numeric"]
+        if len(nums) >= 2:
+            corr = df[nums].corr(numeric_only=True).round(2)
+            fig = px.imshow(corr, text_auto=True, title="Correlation matrix")
+            fig.update_layout(template="plotly_white")
+            return {"type": "correlation", "figure": fig, "table": corr.reset_index().to_dict("records"), "summary": "Correlation matrix generated."}
+        return {"type": "none", "figure": empty_figure("Correlation"), "table": [], "summary": "Need at least two numeric columns for correlation."}
+
+    if ("trend" in q or "month" in q or "time" in q) and metric and date_col:
+        tmp = df.dropna(subset=[date_col]).copy()
+        tmp["period"] = tmp[date_col].dt.to_period("M").dt.to_timestamp()
+        trend = tmp.groupby("period")[metric].sum().reset_index()
+        fig = px.line(trend, x="period", y=metric, markers=True, title=f"Monthly {metric} trend")
+        fig.update_layout(template="plotly_white")
+        return {"type": "trend", "figure": fig, "table": trend.tail(limit).to_dict("records"), "summary": f"Monthly trend generated for {metric}."}
+
+    if metric and category:
+        grouped = df.groupby(category, dropna=False)[metric].sum().sort_values(ascending=False).head(limit).reset_index()
+        grouped[category] = grouped[category].astype(str)
+        fig = px.bar(grouped, x=category, y=metric, title=f"Top {limit} {category} by {metric}")
+        fig.update_layout(template="plotly_white")
+        return {"type": "grouped", "figure": fig, "table": grouped.to_dict("records"), "summary": f"Grouped analysis generated: {metric} by {category}."}
+
+    return {"type": "profile", "figure": empty_figure("Custom analysis"), "table": [], "summary": "Try questions like 'sales by region', 'top 10 products by profit', 'monthly revenue trend', 'missing values', or 'correlation'."}
+
+
+def find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
+    for col in columns:
+        low = col.lower()
+        if low in text:
+            return col
+        normalized = re.sub(r"[^a-z0-9]+", " ", low).strip()
+        if normalized and normalized in text:
+            return col
+    return None
+
+
+def ai_explain_dataset(profile: Dict[str, Any], insights: List[str], user_question: str = "") -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "\n".join(f"- {x}" for x in insights)
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        compact_profile = {
+            "rows": profile.get("rows"),
+            "columns": profile.get("columns"),
+            "numeric_columns": profile.get("numeric_columns", [])[:20],
+            "categorical_columns": profile.get("categorical_columns", [])[:20],
+            "date_columns": profile.get("date_columns", [])[:10],
+            "missing_total": profile.get("missing_total"),
+            "duplicate_rows": profile.get("duplicate_rows"),
+            "numeric_summary": profile.get("numeric_summary", [])[:10],
+            "category_summary": profile.get("category_summary", [])[:10],
+            "rule_based_insights": insights,
+            "user_question": user_question,
+        }
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=(
+                "You are a senior data analyst. Explain the dataset in concise business language. "
+                "Use only the provided profile; do not invent numbers. Return 5-8 bullet points.\n\n"
+                + json.dumps(compact_profile, default=str)
+            ),
+        )
+        return response.output_text.strip()
+    except Exception as exc:
+        return "\n".join(f"- {x}" for x in insights) + f"\n- AI provider fallback used: {type(exc).__name__}."
