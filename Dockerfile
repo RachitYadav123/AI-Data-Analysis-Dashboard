@@ -4,6 +4,8 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PORT=10000
+ENV DATA_DIR=/app/data
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -12,13 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p instance uploads
+RUN mkdir -p /app/data/uploads /app/data/reports
 
 EXPOSE 10000
 
-CMD ["gunicorn", "--bind", "0.0.0.0:10000", "wsgi:app"]
+CMD ["gunicorn", "wsgi:app", "--bind", "0.0.0.0:10000", "--workers", "2", "--threads", "4", "--timeout", "180"]
